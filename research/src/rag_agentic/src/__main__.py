@@ -43,7 +43,15 @@ async def main():
   sample_docs = [
     Document(
       id="doc1",
-      content="Machine learning is a subset of artificial intelligence that focuses on algorithms that can learn from data.",
+      content=(
+        "Machine learning is a subset of artificial intelligence that enables computer systems "
+        "to automatically learn and improve from data without being explicitly programmed. "
+        "By analyzing large amounts of examples, machine learning algorithms can recognize "
+        "patterns, make predictions, and support decision-making in real-world applications. "
+        "Common techniques in ML include supervised learning, unsupervised learning, and "
+        "reinforcement learning, each suited for different types of problems such as "
+        "classification, clustering, or sequential decision-making."  
+      ),
       metadata={
         "source": "textbook",
         "topic": "ML"
@@ -52,7 +60,16 @@ async def main():
     ),
     Document(
       id="doc2",
-      content="Neural networks are computing systems inspired by biological neural networks.",
+      content=(
+        "Neural networks are a foundational concept in AI and represent a class of computing "
+        "systems inspired by the structure of the human brain. These networks are composed of "
+        "interconnected layers of artificial neurons that process data through weighted "
+        "connections. By adjusting the weights during training, neural networks can learn "
+        "complex relationships in data. In modern artificial intelligence research, deep "
+        "neural networks power breakthroughs in computer vision, natural language processing, "
+        "and speech recognition. Their success demonstrates how AI systems can achieve "
+        "human-level performance in tasks once thought impossible for machines."
+      ),
       metadata={
         "source": "research",
         "topic": "AI"
@@ -86,7 +103,7 @@ async def main():
   test_queries = [
     "What is machine learning?",
     "How are neural networks related to AI?",
-    "Compare machine learning and neural networks",
+    "machine learning vs neural networks",
     "Why is machine learning important for AI?"
   ]
   

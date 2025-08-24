@@ -42,7 +42,7 @@ class Chunk(BaseModel):
   embedding: Optional[List[float]] = None    
 
 
-class RetrivalResult(BaseModel):
+class RetrievalResult(BaseModel):
   chunk: Chunk
   score: float
   source: str # vector, graph, hybrid
@@ -58,7 +58,7 @@ class QueryPlan(BaseModel):
   
 class AgentResponse(BaseModel):
   answer: str
-  sources: List[RetrivalResult]
+  sources: List[RetrievalResult]
   confidence: float
   reasoning_steps: List[str]
   query_plan: QueryPlan

@@ -2,7 +2,7 @@
 
 import os
 from typing import Dict, Any
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 
 
 
@@ -32,8 +32,6 @@ class Settings(BaseSettings):
   MAX_ITERATIONS: int = 5
   AGENT_TEMPERATURE: float = 0.1
   
-  class Config:
-    env_file = ".env"
-    
+ 
     
 settings = Settings()

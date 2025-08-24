@@ -67,9 +67,22 @@ class AdvancedRAGAgent:
     final_results = sorted(unique_results.values(), key=lambda x: x.score, reverse=True)[:5]
     
     # Step 4: Generate answer using LLM
-    context = "\n\n".join([f"Source {i+1}: {result.chunk.context}" for i, result in enumerate(final_results) ])
+    context = "\n\n".join([f"Source {i+1}: {result.chunk.content}" for i, result in enumerate(final_results) ])
     
-    answer = await self._generate_answer
+    answer = await self._generate_answer(query, context, query_plan)
+    confidence = self._calculate_confidence(final_results)
+    
+    
+    reasoning_steps.append(f"Generated answer with {len(final_results)} sources")
+    reasoning_steps.append(f"Confidence: {confidence:.2f}")
+    
+    return AgentResponse(
+      answer=answer,
+      sources=final_results,
+      confidence=confidence,
+      reasoning_steps=reasoning_steps,
+      query_plan=query_plan
+    )
     
 
 
@@ -109,14 +122,14 @@ class AdvancedRAGAgent:
   async def _call_llm(self, prompt: str) -> str:
     """Call LLM Service - implement based on your chosen LLM"""
    
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    client = genai.Client(api_key="AIzaSyDycMN2ITW9KED3U0sRa4LMwvM0jV-c3zk")
     
     response = client.models.generate_content(
       model="gemini-2.5-flash-preview-05-20",
       contents=prompt
     )
    
-    return response
+    return response.text
 
 
 

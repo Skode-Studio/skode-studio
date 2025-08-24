@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class ChromaVectorStore:
   """ChromaDB-based vector store with advanced features"""
   
-  def __init__(self, persist_directory: str = "./db/chroma_db"):
+  def __init__(self, persist_directory: str = "./data/chroma_db"):
     self.client = chromadb.PersistentClient(
       path=persist_directory,
       settings=ChromaSettings(anonymized_telemetry=False)
@@ -64,7 +64,7 @@ class ChromaVectorStore:
     )
     
     retrieval_results = []
-    for i in range(len(results['id'][0])):
+    for i in range(len(results['ids'][0])):
       chunk = Chunk(
         id=results['ids'][0][i],
         content=results['documents'][0][i],

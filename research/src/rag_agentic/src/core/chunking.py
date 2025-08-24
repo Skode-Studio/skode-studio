@@ -16,7 +16,7 @@ class AdvancedChunker:
     
     # Different splitters for different content types
     self.text_splitter = RecursiveCharacterTextSplitter(
-      chunk_siz=chunk_size,
+      chunk_size=chunk_size,
       chunk_overlap=chunk_overlap,
       separators=["\n\n", "\n", ". ", "! ", "? ", ", ", " ", ""]
     )

@@ -39,7 +39,7 @@ class Neo4jGraphStore:
     with self.driver.session() as session:
       # Create document node
       session.run("""
-                  MERGE (d: Document {id: $doc_id})
+                  MERGE (d:Document {id: $doc_id})
                   SET d.content = $content,
                       d.doc_type = $doc_type,
                       d.created_at = $created_at,
@@ -74,6 +74,7 @@ class Neo4jGraphStore:
                   )
       
       # Extract and link entities (simplified NER)
+      self._extract_entities(document.id, document.content)
       
 
   def _extract_entities(self, doc_id: str, content: str):
@@ -108,12 +109,12 @@ class Neo4jGraphStore:
       query_words = query.lower().split()
       
       results = session.run("""
-                            MATCH (e:Entiy)
+                            MATCH (e:Entity)
                             WHERE ANY(word IN $query_words WHERE toLower(e.name) CONTAINS word)
-                            MATCH (e)<-[:MENTIONS]-(d:Document)-[:CONTAINS]->(e:Chunk)
+                            MATCH (e)<-[:MENTIONS]-(d:Document)-[:CONTAINS]->(c:Chunk)
                             RETURN c.id as chunk_id, c.content as content, c.chunk_index as chunk_index,
-                                  d.id as document_id, d.metadata as metadata,
-                                  count(*) as relevance_store
+                                  d.id as doc_id, d.metadata as metadata,
+                                  count(*) as relevance_score
                             ORDER BY relevance_score DESC
                             LIMIT 10
                             """,
@@ -137,6 +138,8 @@ class Neo4jGraphStore:
           score=float(record['relevance_score']) / 10.0, # Normalize score to [0, 1] range
           source="graph"
         ))
+        
+      return retrieval_results
         
         
   def close(self):
