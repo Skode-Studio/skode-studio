@@ -12,6 +12,7 @@ import logging
 
 
 
+
 class DocumentSegmentationAgent:
   """
   Intelligent document segmentation agent with semantic analysis capabilities.
