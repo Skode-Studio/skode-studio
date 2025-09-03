@@ -122,7 +122,7 @@ class AdvancedRAGAgent:
   async def _call_llm(self, prompt: str) -> str:
     """Call LLM Service - implement based on your chosen LLM"""
    
-    client = genai.Client(api_key="AIzaSyDycMN2ITW9KED3U0sRa4LMwvM0jV-c3zk")
+    client = genai.Client(api_key="")
     
     response = client.models.generate_content(
       model="gemini-2.5-flash-preview-05-20",
