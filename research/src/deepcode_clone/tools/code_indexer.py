@@ -19,11 +19,14 @@ from dataclasses import dataclass, asdict
 import logging
 from pathlib import Path
 import asyncio
+import yaml
+import os
+from pathlib import Path
 
 
 
 
-def get_default_models(config_path: str = "mcp_agent.config.ymal"):
+def get_default_models(config_path: str = "mcp_agent.config.yaml"):
   """
   Get default models from configuration file.
   
@@ -33,6 +36,33 @@ def get_default_models(config_path: str = "mcp_agent.config.ymal"):
   Returns:
     dict: Dictionary with 'anthropic' and 'openai' default models
   """
+  try:
+    if os.path.exists(config_path):
+      with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+        
+      anthropic_model = config.get("anthropic", {}).get(
+        "default_model", "claude-sonnet-4-20250514"
+      )
+
+      openai_model = config.get("openai", {}).get(
+        "default_model", "o3-mini"
+      )
+      
+      return {
+        "anthropic": anthropic_model,
+        "openai": openai_model
+      }
+      
+    else:
+      print(f"Config file {config_path} not found, using default models")
+      return {"anthropic": "claude-sonnet-4-20250514", "openai": "o3-mini"}
+    
+  except Exception as e:
+    print(f"Error reading config file {config_path}: {e}")
+    return {"anthropic": "claude-sonnet-4-20250514", "openai": "o3-mini"}
+    
+  
   
   
 @dataclass
@@ -89,48 +119,252 @@ class CodeIndexer:
     enable_pre_filtering: bool = True
   ):
     """Initialization"""
+    
     # Load configurations first
+    self.config_path = config_path
+    self.indexer_config_path = indexer_config_path
+    self.api_config = self._load_api_config()
+    self.indexer_config = self._load_indexer_config()
+    self.default_models = get_default_models("mcp_agent.config.yaml")
+    
     
     # Use config paths if not provided as parameters
+    paths_config = self.indexer_config.get("paths", {})
+    self.code_base_path = Path(
+      code_base_path or paths_config.get("code_base_path", "code_base")
+    )
+    self.output_dir = Path(output_dir or paths_config.get("output_dir", "indexes"))
+    self.target_structure = (
+      target_structure # This must be provided as it's project specific
+    )
+    self.enable_pre_filtering = enable_pre_filtering
+    
     
     # LLM clients
+    self.llm_client = None
+    self.llm_client_type = None
+    
     
     # Initialize logger early
+    self.logger = self._setup_logger()
+    
     
     # Create output directory if it doesn't exist
+    self.output_dir.mkdir(parents=True, exist_ok=True)
+    
     
     # Load file analysis configuration
+    file_analysis_config = self.indexer_config.get("file_analysis", {})
+    self.supported_extensions = set(
+      file_analysis_config.get(
+        "supported_extensions",
+        [
+          ".py",
+          ".js",
+          ".ts",
+          ".java",
+          ".cpp",
+          ".c",
+          ".h",
+          ".hpp",
+          ".cs",
+          ".php",
+          ".rb",
+          ".go",
+          ".rs",
+          ".scala",
+          ".kt",
+          ".swift",
+          ".m",
+          ".mm",
+          ".r",
+          ".matlab",
+          ".sql",
+          ".sh",
+          ".bat",
+          ".ps1",
+          ".yaml",
+          ".yml",
+          ".json",
+          ".xml",
+          ".toml",
+        ]
+      )
+    )
+    self.skip_directories = set(
+      file_analysis_config.get(
+        "skip_directories",
+        [
+          "__pycache__",
+          "node_modules",
+          "target",
+          "build",
+          "dist",
+          "venv",
+          "env",
+        ]
+      )
+    )
+    self.max_file_size = file_analysis_config.get("max_file_size", 1048576)
+    self.max_content_length = file_analysis_config.get("max_content_length", 3000)
+    
     
     # Load LLM configuration
+    llm_config = self.indexer_config.get("llm", {})
+    self.model_provider = llm_config.get("model_provider", "anthropic")
+    self.llm_max_tokens = llm_config.get("max_tokens", 4000)
+    self.llm_temperature = llm_config.get("temperature", 0.3)
+    self.llm_system_prompt = llm_config.get(
+      "system_prompt",
+      "You are a code analysis expert. Provide precise, structured analysis of code relationships and similarities."
+    )
+    self.request_delay = llm_config.get("request_delay", 0.1)
+    self.max_retries = llm_config.get("max_retries", 3)
+    self.retry_delay = llm_config.get("retry_delay", 1.0)
+    
     
     # Load relationship configuration
+    relationship_config = self.indexer_config.get("relationships", {})
+    self.min_confidence_score = relationship_config.get("min_confidence_score", 0.3)
+    self.high_confidence_threshold = relationship_config.get(
+      "high_confidence_threshold", 0.7
+    )
+    self.relationship_types = relationship_config.get(
+      "relationship_types",
+      {
+        "direct_match": 1.0,
+        "partial_match": 0.8,
+        "reference": 0.6,
+        "utility": 0.4,
+      },
+    )
+    
     
     # Load performance configuration
+    performace_config = self.indexer_config.get("performance", {})
+    self.enable_concurrent_analysis = performace_config.get(
+      "enable_concurrent_analysis", False
+    )
+    self.max_concurrent_files = performace_config.get("max_concurrent_files", 5)
+    self.enable_content_caching = performace_config.get("enable_content_caching", False)
+    self.max_cache_size = performace_config.get("max_cache_size", 100)
+    
     
     # Load debug configuration
+    debug_config = self.indexer_config.get("debug", {})
+    self.save_raw_responses = debug_config.get("save_raw_responses", False)
+    self.raw_responses_dir = debug_config.get(
+      "raw_responses_dir", "debug_responses"
+    )
+    self.verbose_output = debug_config.get("verbose_output", False)
+    self.mock_llm_responses = debug_config.get("mock_llm_responses", False)
+    
     
     # Load output configuration
+    output_config = self.indexer_config.get("output", {})
+    self.generate_summary = output_config.get("generate_summary", True)
+    self.generate_statistics = output_config.get("generate_statistics", True)
+    self.include_metadata = output_config.get("include_metadata", True)
+    self.index_filename_pattern = output_config.get(
+      "index_filename_pattern", "{repo_name}_index.json"
+    )
+    self.summary_filename = output_config.get(
+      "summary_filename", "indexing_summary.json"
+    )
+    self.stats_filename = output_config.get(
+      "stats_filename", "indexing_statistics.json"
+    )
+    
     
     # Initialize caching if enabled
+    self.content_cache = {} if self.enable_content_caching else None
+    
     
     # Create debug directory if needed
+    if self.save_raw_responses:
+      Path(self.raw_responses_dir).mkdir(parents=True, exist_ok=True)
+    
     
     # Debug logging
+    if self.verbose_output:
+      self.logger.info(
+        f"Initialized CodeIndexer with config: {self.indexer_config_path}"
+      )
+      self.logger.info(f"Code base path: {self.code_base_path}")
+      self.logger.info(f"Output directory: {self.output_dir}")
+      self.logger.info(f"Model provider: {self.model_provider}")
+      self.logger.info(f"Concurrent analysis: {self.enable_concurrent_analysis}")
+      self.logger.info(f"Content caching: {self.enable_content_caching}")
+      self.logger.info(f"Mock LLM responses: {self.mock_llm_responses}")
+    
     
     
 
   def _setup_logger(self) -> logging.Logger:
     """Setup logging configuration from config file"""
+    logger = logging.getLogger("CodeIndexer")
+    
+    # Get logging config
+    logging_config = self.indexer_config.get("logging", {})
+    log_level = logging_config.get("level", "INFO")
+    log_format = logging_config.get(
+      "log_format", "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    
+    # Clear existing handlers
+    logger.handlers.clear()
+    
+    # Console handler
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(log_format)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    
+    # File handler if enabled
+    if logging_config.get("log_to_file", False):
+      log_file = logging_config.get("log_file", "indexer.log")
+      file_handler = logging.FileHandler(log_file, encoding="utf-8")
+      file_handler.setFormatter(formatter)
+      logger.addHandler(file_handler)
+      
+    return logger
+    
     
     
   
   def _load_api_config(self) -> Dict[str, Any]:
     """Load API configuration from YAML file"""
     
+    try:
+      with open(self.config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+    
+    except Exception as e:
+      # Create a basic logger for this error since self.logger doesn't exist yet
+      print(f"Warning: Failed to load API config from {self.config_path}: {e}")
+      return {}
+    
     
   
   def _load_indexer_config(self) -> Dict[str, Any]:
-    """Load indexer configuration from YAML file""" 
+    """Load indexer configuration from YAML file"""
+    
+    try:
+      with open(self.indexer_config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+        if config is None:
+          config = {}
+          
+        return config
+    
+    except Exception as e:
+      print(
+        f"Warning: Failed to load indexer config from {self.indexer_config_path}: {e}"
+      )
+      print("Using default configuration values")
+      return {}
     
     
   
