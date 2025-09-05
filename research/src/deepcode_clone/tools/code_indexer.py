@@ -22,6 +22,7 @@ import asyncio
 import yaml
 import os
 from pathlib import Path
+from utils.llm_utils import get_preferred_llm_class
 
 
 
@@ -382,9 +383,70 @@ class CodeIndexer:
     """Call LLM for code analysis with retry mechanism and debugging support"""
 
 
+  
+  
+  
 
-  def _generate_mock_response(self, prompt: str) -> str:
+
+  def _generate_mock_response(
+    self, 
+    prompt: str
+  ) -> str:
     """Generate mock LLM response for testing"""
+    
+    # CASE 1: File analysis mock
+    if "JSON format" in prompt and "file_type" in prompt:
+      return """
+      {
+        "file_type": "Python module",
+        "main_functions": ["main_function", "helper_function"],
+        "key_concepts": ["data_processing", "algorithm"],
+        "dependencies": ["numpy", "pandas"],
+        "summary": "Mock analysis of code file functionality."
+      }
+      """
+    
+    # CASE 2: Relationship analysis mock
+    elif "relationships" in prompt:
+      return """
+      {
+        "relationships": [
+          {
+            "target_file_path": "src/core/mock.py",
+            "relationship_type": "partial_match",
+            "confidence_score": 0.8,
+            "helpful_aspects": ["algorithm implementation", "data structures"],
+            "potential_contributions": ["core functionality", "utility methods"],
+            "usage_suggestions": "Mock relationship suggestion for testing"
+          }
+        ]
+      }
+      """
+      
+    # CASE 3: File filtering mock
+    elif "relevant_files" in prompt:
+      return """
+      {
+        "relevant_files": [
+          {
+            "file_path": "mock_file.py",
+            "relevance_reason": "Mock relevance reason",
+            "confidence": 0.9,
+            "expected_contribution": "Mock contribution"
+          }
+        ],
+        "summary": {
+          "total_files_analyzed": "10",
+          "relevant_files_count": "1",
+          "filtering_strategy": "Mock filtering strategy"
+        }
+      }
+      """
+    else:
+      return "Mock LLM response for testing purposes."
+
+    
+      
     
     
   
@@ -400,21 +462,135 @@ class CodeIndexer:
   
   def get_all_repo_files(self, repo_path: Path) -> List[Path]:
     """Recursively get all supported files in a repository"""
+    
+    files = []
+    
+    try:
+      
+      for root, dirs, filenames in os.walk(repo_path):
+        # Skip common non-code directories
+        
+        dirs[:] = [
+          d
+          for d in dirs
+          if not d.startswith(".") and d not in self.skip_directories
+        ]
+        
+        for filename in filenames:
+          file_path = Path(root) / filename
+          if file_path.suffix.lower() in self.supported_extensions:
+            files.append(file_path)
+      
+    except Exception as e:
+      self.logger.error(f"Error traversing {repo_path}: {e}")
+      
+    return files
+    
   
   
   
   def generate_file_tree(self, repo_path: Path, max_depth: int = 5) -> str:
     """Generate file tree structure string for the repository"""
-  
-  
-  
+    
+    tree_lines = []
+    
+    # Recursive to crawl file structure
     def add_to_tree(current_path: Path, prefix: str = "", depth: int = 0):
       """Add to Tree"""
+      
+      if depth > max_depth:
+        return
+      
+      try:
+        items = sorted(
+          current_path.iterdir(),
+          # Use lambdas for short, simple functions 
+          key=lambda x: (x.is_file(), x.name.lower())
+        )
+        
+        # Filter out irrelevant directories and files
+        items = [
+          item
+          for item in items
+          if not item.name.startswith(".") and item.name not in self.skip_directories
+        ]
+        
+        # Compose structure
+        for i, item in enumerate(items):
+          is_last = i == len(items) - 1
+          current_prefix = "└── " if is_last else "├── "
+          tree_lines.append(f"{prefix}{current_prefix}{item.name}")
+          
+          if item.is_dir():
+            extension_prefix = "    " if is_last else "│   "
+            add_to_tree(item, prefix + extension_prefix, depth + 1)
+          elif item.suffix.lower() in self.supported_extensions:
+            # Add file size information
+            try:
+              size = item.stat().st_size
+              
+              if size > 1024:
+                size_str = f" ({size // 1024}KB)"
+              else:
+                size_str = f" ({size}B)"
+                
+              tree_lines[-1] += size_str
+            except (OSError, PermissionError):
+              pass
+      
+      except PermissionError:
+        tree_lines.append(f"{prefix}├── [Permission Denied]")
+      except Exception as e:
+        tree_lines.append(f"{prefix}├── [Error: {str(e)}]")      
+    
+    
+    tree_lines.append(f"{repo_path.name}/")
+    add_to_tree(repo_path)
+    return "\n".join(tree_lines)
     
   
 
   async def pre_filter_files(self, repo_path: Path, file_tree: str) -> List[str]:
     """Use LLM to pre-filter relevant files based on target structure"""
+    
+    filter_prompt = f"""
+    You are a code analysis expert, Please analyze the following code repository file tree based on the targer structure and filter out files that may be relevant to the target project
+    
+    Target Project Structure:
+    {self.target_structure}
+    
+    Code Repository Tree:
+    {file_tree}
+    
+    Please analyze which files might be helpful for implementing the target project structur, including:
+    - Core algorithm implementation files (such as GCN, recommendation system, graph neural networks, etc.)
+    - Data processing and preprocessing files
+    - Lost functions and evaluation metric files
+    - Test files
+    - Documentation files
+    
+    Please return the filtering resulst in JSON format:
+    {{
+      "relevant_files": [
+        {{
+          "file_path": "file path relative to repository root",
+          "relevance_reason": "why this file relevant",
+          "confidence": 0.0-1.0,
+          "expected_contribution": "expected contribution to the target project"
+        }}
+      ],
+      "summary": {{
+        "total_files_analyzed": "total number of files analyzed",
+        "relevant_files_count": "number of relevant files",
+        "filtering_strategy": "explanation of filtering strategy"
+      }}
+    }}
+    
+    Only return files with confidence > {self.min_confidence_score}, Focus on files related to recommendation systems, graph neural networks, and diffusion models.
+    """
+    
+    
+      
   
   
   
@@ -480,17 +656,25 @@ class CodeIndexer:
   async def process_repository(self, repo_path: Path) -> RepoIndex:
     """Process a single repository and create complete index with optional concurrent processing"""
   
-    # Step 1: Generate file tree
+    repo_name = repo_path.name
+    self.logger.info(f"Processing repository: {repo_name}")
   
-    # Step 2: Get all files
-  
-    # Step 3: LLM pre-filtering of relevant files
+    # ========== Step 1: Generate file tree ==========
+    self.logger.info("Generating file tree structure")
+    file_tree = self.generate_file_tree(repo_path, max_depth=5)
     
-    # Step 4: Filter file list based on filtering results
+    # ========== Step 2: Get all files ==========
+    all_files = self.get_all_repo_files(repo_path)
+    self.logger.info(f"Found {len(all_files)} files in {repo_name}")
+    
+    # ========== Step 3: LLM pre-filtering of relevant files ==========
+    
+    
+    # ========== Step 4: Filter file list based on filtering results ==========
 
-    # Step 5: Analyze filtered files (concurrent or sequential)
+    # ========== Step 5: Analyze filtered files (concurrent or sequential) ==========
     
-    # Step 6: Create repository index
+    # ========== Step 6: Create repository index ==========
     
     
     
@@ -506,6 +690,33 @@ class CodeIndexer:
     
   async def build_all_indexes(self) -> Dict[str, str]:
     """Build indexes for all repositories in code_base"""
+    
+    if not self.code_base_path.exists():
+      raise FileNotFoundError(
+        f"Code base path does not exist: {self.code_base_path}"
+      )
+      
+    # Get all repository directories
+    # /my_project_example/
+    # ├── src/           ← included
+    # ├── tests/         ← included  
+    # ├── docs/          ← included
+    # ├── .git/          ← excluded (hidden)
+    # ├── .vscode/       ← excluded (hidden)
+    # └── README.md      ← excluded (not a directory)
+    repo_dirs = [
+      d
+      for d in self.code_base_path.iterdir()
+      if d.is_dir() and not d.name.startswith(".")
+    ]
+    
+    if not repo_dirs:
+      raise ValueError(f"No repositories found in {self.code_base_path}")
+    
+    self.logger.info(f"Found {len(repo_dirs)} repositories to process")
+
+    
+    
     
     
     
@@ -528,7 +739,121 @@ class CodeIndexer:
 async def main():
   """Main function to run the code indexer with full configuration support"""
   
+  # Configuration - can be overridden by config file
+  config_file = "DeepCode/tools/indexer_config.yaml"
+  api_config_file = "DeepCode/mcp_agent.secrets.yaml"
+
+  # You can override these parameters or let them be read from config
+  code_base_path = "DeepCode/deepcode_lab/papers/1/code_base" # Will use config file value if None
+  output_dir = (
+    "DeepCode/deepcode_lab/papers/1/indexes/" # Will use config file if None
+  )
   
+  # Taret structure - this shoulde be customized for your specific project
+  target_structure = """
+                    project/
+                    ├── src/
+                    │   ├── core/
+                    │   │   ├── gcn.py        # GCN encoder
+                    │   │   ├── diffusion.py  # forward/reverse processes
+                    │   │   ├── denoiser.py   # denoising MLP
+                    │   │   └── fusion.py     # fusion combiner
+                    │   ├── models/           # model wrapper classes
+                    │   │   └── recdiff.py
+                    │   ├── utils/
+                    │   │   ├── data.py       # loading & preprocessing
+                    │   │   ├── predictor.py  # scoring functions
+                    │   │   ├── loss.py       # loss functions
+                    │   │   ├── metrics.py    # NDCG, Recall etc.
+                    │   │   └── sched.py      # beta/alpha schedule utils
+                    │   └── configs/
+                    │       └── default.yaml  # hyperparameters, paths
+                    ├── tests/
+                    │   ├── test_gcn.py
+                    │   ├── test_diffusion.py
+                    │   ├── test_denoiser.py
+                    │   ├── test_loss.py
+                    │   └── test_pipeline.py
+                    ├── docs/
+                    │   ├── architecture.md
+                    │   ├── api_reference.md
+                    │   └── README.md
+                    ├── experiments/
+                    │   ├── run_experiment.py
+                    │   └── notebooks/
+                    │       └── analysis.ipynb
+                    ├── requirements.txt
+                    └── setup.py
+                    """
+  
+  print("Starting Code Indexer with Enhanced COnfiguration Support")
+  print("Configuration file: {config_file}")
+  print("API Configuration file: {api_config_file}")
+  
+  # Create indexer with fill configuration support
+  try:
+    
+    # Initialize Code Indexer
+    indexer = CodeIndexer(
+      code_base_path=code_base_path, # None = read from config
+      target_structure=target_structure,
+      output_dir=output_dir,
+      config_path=api_config_file,
+      indexer_config_path=config_file,
+      enable_pre_filtering=True # Can be overridden in config
+    )
+    
+    # Display configuration information
+    print(f"📁 Code base path: {indexer.code_base_path}")
+    print(f"📂 Output directory: {indexer.output_dir}")
+    print(
+        f"🤖 Default models: Anthropic={indexer.default_models['anthropic']}, OpenAI={indexer.default_models['openai']}"
+    )
+    print(f"🔧 Preferred LLM: {get_preferred_llm_class(api_config_file).__name__}")
+    print(
+        f"⚡ Concurrent analysis: {'enabled' if indexer.enable_concurrent_analysis else 'disabled'}"
+    )
+    print(
+        f"🗄️  Content caching: {'enabled' if indexer.enable_content_caching else 'disabled'}"
+    )
+    print(
+        f"🔍 Pre-filtering: {'enabled' if indexer.enable_pre_filtering else 'disabled'}"
+    )
+    print(f"🐛 Debug mode: {'enabled' if indexer.verbose_output else 'disabled'}")
+    print(
+        f"🎭 Mock responses: {'enabled' if indexer.mock_llm_responses else 'disabled'}"
+    )
+    
+    
+    # Validate configuration
+    if not indexer.code_base_path.exists():
+      raise FileNotFoundError(
+        f"Code base path doesnot exist: {indexer.code_base_path}"
+      )
+      
+    if not target_structure:
+      raise ValueError("Target structure is required for analysis")
+    
+    
+    print("STARTING INDEXING PROCESS...")
+    
+    
+    
+    
+    
+  except FileNotFoundError as e:
+    print(f"❌ File not found error: {e}")
+    print("💡 Please check your configuration file paths")
+  except ValueError as e:
+    int(f"❌ Configuration error: {e}")
+    print("💡 Please check your configuration file settings")
+  except Exception as e:
+    print(f"❌ Indexing failed: {e}")
+    print("💡 Check the logs for more details")
+    
+    
+    
+    
   
 def print_usage_example():
     """Print usage examples for different scenarios"""
