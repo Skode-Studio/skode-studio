@@ -371,6 +371,98 @@ class CodeIndexer:
   
   async def _initialize_llm_client(self):
     """Initialize LLM client (Anthropic or OpenAI) based on API key availability"""
+    if self.llm_client is not None:
+      return self.llm_client, self.llm_client_type
+    
+    # Check if mock responses are enabled
+    if self.mock_llm_responses:
+      self.logger.info("Using mock LLM responses for testing")
+      self.llm_client = "mock"
+      self.llm_client_type = "mock"
+      return "mock", "mock"
+    
+    # Check which API has available key and try that first
+    anthropic_key = self.api_config.get("anthropic", {}).get("api_key", "")
+    openai_key = self.api_config.get("openai", {}).get("api_key", "")
+    
+    # Try Anthropic API first if key is available
+    if anthropic_key and anthropic_key.strip():
+      try:
+        from anthropic import AsyncAnthropic
+        
+        client = AsyncAnthropic(
+          api_key=anthropic_key
+        )
+        
+        # Test connection with default model from config
+        await client.messages.create(
+          model=self.default_models["anthropic"],
+          max_tokens=10,
+          messages=[
+            {
+              "role": "user",
+              "content": "test"
+            }
+          ]
+        )
+        self.logger.info(f"Using Anthropic API with model: {self.default_models["anthropic"]}")
+        
+        self.llm_client = client
+        self.llm_client_type = "anthropic"
+        
+        return client, "anthropic"
+      
+      except Exception as e:
+        self.logger.warning(f"Anthropic API unavailable: {e}")
+        
+        
+    # Try OpenAI API if Anthropic failed or key not available
+    if openai_key and openai_key.strip():
+      try:
+        from openai import AsyncOpenAI
+        
+        # Hanlde custom base_url if specified
+        openai_config = self.api_config.get("openai", {})
+        base_url = openai_config.get("base_url")
+        
+        if base_url:
+          client = AsyncOpenAI(
+            api_key=openai_key,
+            base_url=base_url
+          )
+        else:
+          client = AsyncOpenAI(
+            api_key=openai_key
+          )
+          
+        # Test connection with default model from config
+        await client.chat.completions.create(
+          model=self.default_models["openai"],
+          max_tokens=10,
+          messages=[
+            {
+              "role": "user",
+              "content": "test"
+            }
+          ]
+        )
+        self.logger.warning(f"OpenAI API unavailable: {e}")
+        
+        if base_url:
+          self.logger.info(f"Using custom base URL: {base_url}")
+        self.llm_client = client
+        self.llm_client_type = "openai"
+        
+        return client, "openai"
+        
+      except Exception as e:
+        self.logger.warning(f"OpenAI API unavailable: {e}")
+    
+    raise ValueError(
+      "No available LLM API - please check your API keys in configuration"
+    )
+      
+    
     
     
     
@@ -382,8 +474,101 @@ class CodeIndexer:
   ) -> str:
     """Call LLM for code analysis with retry mechanism and debugging support"""
 
+    if system_prompt is None:
+      system_prompt = self.llm_system_prompt
+    if max_tokens is None:
+      max_tokens = self.llm_max_tokens
+      
+    # Mock response for testing
+    if self.mock_llm_responses:
+      mock_response = self._generate_mock_response(prompt)
+      if self.save_raw_responses:
+        self._save_debug_response("mock", prompt, mock_response)
+      return mock_response
+    
+    last_error = None
+    
+    # Retry mechanism
+    for attempt in range(self.max_retries):
+      try:
+        if self.verbose_output and attempt > 0:
+          self.logger.info(
+            f"LLM call attempt {attempt + 1}/{self.max_retries}"
+          )
+          
+        client, client_type = await self._initialize_llm_client()
+        
+        # === ANTHROPIC ===
+        if client_type == "anthropic":
+          response = await client.messages.create(
+            model=self.default_models["anthropic"],
+            system=system_prompt,
+            messages=[
+              {
+                "role": "user",
+                "content": prompt
+              }
+            ],
+            max_tokens=max_tokens,
+            temperature=self.llm_temperature
+          )
+          
+          content = ""
+          for block in response.content:
+            if block.type == "text":
+              content += block.text
+              
+          # Save debug response if enabled
+          if self.save_raw_responses:
+            self._save_debug_response("anthropic", prompt, content)
+            
+          return content
+        
+        # === OPENAI ===
+        elif client_type == "openai":
+          messages = [
+            {
+              "role": "system",
+              "content": system_prompt
+            },
+            {
+              "role": "user",
+              "content": prompt
+            }
+          ]
+          
+          response = await client.chat.completions.create(
+            model=self.default_models["openai"],
+            messages=messages,
+            max_tokens=max_tokens
+          )
+          
+          content = response.choices[0].message.content or ""
+          
+          # Save debug response if enabled
+          if self.save_raw_responses:
+            self._save_debug_response("openai", prompt, content)
+            
+          return content
+        
+        # === OTHERS ===
+        else:
+          raise ValueError(f"Unsupported client type: {client_type}")
+        
+      except Exception as e:
+        last_error = e
+        self.logger.warning(f"LLM call attempt {attempt + 1} failed {e}")
+        
+        if attempt < self.max_retries - 1:
+          await asyncio.sleep(
+            self.retry_delay * (attempt + 1)
+          ) # Exponential backoff
 
-  
+    
+    # All retries failed
+    error_msg = f"LLM call failed after {self.max_retries} attempts. Last error: {str(last_error)}"
+    self.logger.error(error_msg)
+    return f"Error in LLM analysis: {error_msg}"
   
   
 
