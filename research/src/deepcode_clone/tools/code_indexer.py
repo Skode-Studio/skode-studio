@@ -754,7 +754,7 @@ class CodeIndexer:
     - Test files
     - Documentation files
     
-    Please return the filtering resulst in JSON format:
+    Please return the filtering results in JSON format:
     {{
       "relevant_files": [
         {{
@@ -774,9 +774,50 @@ class CodeIndexer:
     Only return files with confidence > {self.min_confidence_score}, Focus on files related to recommendation systems, graph neural networks, and diffusion models.
     """
     
-    
+    try:
+      self.logger.info("Starting LLM pre-filtering of files...")
+      llm_response = await self._call_llm(
+        filter_prompt,
+        system_prompt="You are a professional code analysis and project architecture expert, skilled at identifying code file functionality and relevance.",
+        max_tokens=2000
+      )
       
-  
+      # Parse JSON response
+      match = re.search(r"\{.*\}", llm_response, re.DOTALL) # The regex searches for the first occurrence of content that starts with { and ends with },
+      if not match:
+        self.logger.warning(
+          "Unable to parse LLM filtering response, will use all files"
+        )
+        return []
+      
+      filter_data = json.loads(match.group(0))
+      relevant_files = filter_data.get("relevant_files", [])
+      
+      # Extract file paths
+      selected_files = []
+      for file_info in relevant_files:
+        file_path = file_info.get("file_path", "")
+        confidence = file_info.get("confidence", 0.0)
+        
+        # Use configured minimum confidence threshold
+        if file_path and confidence > self.min_confidence_score:
+          selected_files.append(file_path)
+          
+      summary = filter_data.get("summary", {})
+      self.logger.info(
+        f"LLM filtering completed: {summary.get('relevant_files_count', len(selected_files))} relevant files selected"
+      )
+      self.logger.info(
+        f"Filtering strategy: {summary.get('filtering_strategy', 'Not provided')}"
+      )
+      
+      return selected_files
+    
+    except Exception as e:
+      self.logger.error(f"LLM pre-filtering failed: {e}")
+      self.logger.info("Will fallback to analyzing all files")
+      return []
+      
   
   
   def filter_files_by_paths(
@@ -787,16 +828,65 @@ class CodeIndexer:
   ) -> List[Path]:
     """Filter file list based on LLM-selected paths"""
     
+    if not selected_paths:
+      return all_files
+    
+    filtered_files = []
+    
+    for file_path in all_files:
+      # Get path relative to repository root
+      # examples: 
+      # repo_path = Path("/project")
+      # file1 = Path("/project/src/main.py")
+      # relative1 = file1.relative_to(repo_path)  # Returns: src/main.py
+      relative_path = str(file_path.relative_to(repo_path))
+      
+      # Check if it's in the selected list
+      for selected_path in selected_paths:
+        # Normalize path comparison
+        if (
+          relative_path == selected_path 
+          or relative_path.replace("\\", "/") == selected_path.replace("\\", "/")
+          or selected_path in relative_path 
+          or relative_path in selected_path    
+        ):
+          filtered_files.append(file_path)
+          break
+        
+    return filtered_files
+    
+    
     
   
   def _get_cache_key(self, file_path: Path) -> str:
     """Generate cache key for file content"""
     
+    try:
+      stats = file_path.stat() # file statistics
+      return f"{file_path}:{stats.st_mtime}:{stats.st_size}"
+    except (OSError, PermissionError):
+      return str(file_path)  
+  
   
   
   def _manage_cache_size(self):
     """Manage cache size to stay within limits"""
     
+    if not self.enable_content_caching or not self.content_cache:
+      return
+    
+    if len(self.content_cache) > self.max_cache_size:
+      # Remove oldest entries (simple FIFO strategy)
+      excess_count = len(self.content_cache) - self.max_cache_size + 10
+      keys_to_remove = list(self.content_cache.keys())[:excess_count]
+      
+      for key in keys_to_remove:
+        del self.content_cache[key]
+
+      if self.verbose_output:
+        self.logger.info(
+          f"Cache cleaned: removed {excess_count} entries, {len(self.content_cache)} entries remaining"
+        )
     
   
   async def analyze_file_content(self, file_path: Path) -> FileSummary:
@@ -804,27 +894,218 @@ class CodeIndexer:
 
     try:
       """"""
-      # Check file size before reading
+      # ====== Check file size before reading ======
+      file_size = file_path.stat().st_size
+      if file_size > self.max_file_size:
+        self.logger.warning(
+          f"Skipping file {file_path} - size {file_size} bytes exceeds limit {self.max_file_size}"
+        )
+        return FileSummary(
+          file_path=str(file_path.relative_to(self.code_base_path)),
+          file_type="skipped - too large",
+          main_functions=[],
+          key_concepts=[],
+          dependencies=[],
+          summary=f"File skipped - size {file_size} bytes exceeds {self.max_file_size} byte limit",
+          lines_of_code=0,
+          last_modified=datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+        )
+        
+        
+      # ====== Check cache if enabled ======
+      cache_key = None
+      if self.enable_content_caching:
+        cache_key = self._get_cache_key(file_path)
+        if cache_key in self.content_cache:
+          if self.verbose_output:
+            self.logger.info(f"Using cached analysis for {file_path.name}")
+          return self.content_cache[cache_key]
       
-      # Check cache if enabled
       
-      # Get file stats
+      # ====== Get content of the file ======
+      with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
       
-      # Truncate content based on config
       
-      # Create analysis prompt
+      # ====== Get file stats ======
+      stats = file_path.stat()
+      lines_of_code = len([line for line in content.split("\n") if line.strip()])
       
-      # Get LLM analysis with configured parameters
       
-      # Cache the result if caching is enabled
+      # ====== Truncate content based on config ======
+      content_for_analysis = content[: self.max_content_length]
+      content_suffix = "..." if len(content) > self.max_content_length else ""
+      
+      
+      # ====== Create analysis prompt ======
+      analysis_prompt = f"""
+        Analyze this code file and provide a structured summary:
+        
+        File: {file_path.name}
+        Content:
+        ```
+        {content_for_analysis}{content_suffix}
+        ```
+        
+        Please provide analysis in this JSON format:
+        {{
+          "file_type": "description of what type of file this is",
+          "main_functions": ["list", "of", "main", "functions", "or", "classes"],
+          "key_concepts": ["important", "concepts", "algorithms", "patterns"],
+          "dependencies": ["external", "libraries", "or", "imports"],
+          "summary": "2-3 sentence summary of what this file does"
+        }}
+        
+        Focus on the core functionality and potential reusability.
+      """
+      
+      
+      # ====== Get LLM analysis with configured parameters ======
+      # Response
+      llm_response = await self._call_llm(analysis_prompt, max_tokens=1000)
+      
+      # Parse JSON
+      try:
+        # Try to parse JSON response
+        match = re.match(r"\{.*}", llm_response, re.DOTALL)
+        analysis_data = json.loads(match.group(0)) # group(0): entire string match
+      except json.JSONDecodeError:
+        # Fallback to basic analysis if JSON parsing fails
+        analysis_data = {
+          "file_type": f"{file_path.suffix} file",
+          "main_functions": [],
+          "key_concepts": [],
+          "dependencies": [],
+          "summary": "File analysis failed - JSON parsing error"
+        }
+      
+      # File Summary
+      file_summary = FileSummary(
+        file_path=str(file_path.relative_to(self.code_base_path)),
+        file_type=analysis_data.get("file_type", "unknown"),
+        main_functions=analysis_data.get("main_functions", []),
+        key_concepts=analysis_data.get("key_concepts", []),
+        dependencies=analysis_data.get("dependencies", []),
+        summary=analysis_data.get("summary", "No summary available"),
+        lines_of_code=lines_of_code,
+        last_modified=datetime.fromtimestamp(stats.st_mtime).isoformat()
+      )
+        
+      
+      # ====== Cache the result if caching is enabled ======
+      if self.enable_content_caching and cache_key:
+        self.content_cache[cache_key] = file_summary
+        self._manage_cache_size()
+        
+        
+      # ====== Return ======
+      return file_summary
       
     except Exception as e:
-      """"""
+      self.logger.error(f"Error analyzing file {file_path}: {e}")
+      return FileSummary(
+        file_path=str(file_path.relative_to(self.code_base_path)),
+        file_type="error",
+        main_functions=[],
+        key_concepts=[],
+        dependencies=[],
+        summary=f"Analysis failed: {str(e)}",
+        lines_of_code=0,
+        last_modified=""
+      )
       
   
   
-  async def find_relationships(self, file_summary: FileSummary) -> List[FileRelationship]:
-    """Find relationships between a repo file and target structure"""    
+  async def find_relationships(
+    self, 
+    file_summary: FileSummary
+  ) -> List[FileRelationship]:
+    """Find relationships between a repo file and target structure"""
+    
+    # ====== Get Metrics for Find the Relationships about Project Strucure and The File ======
+    relationship_type_desc = []
+    for rel_type, weight in self.relationship_types.items():
+      relationship_type_desc.append(f"- {rel_type} (priority: {weight})")
+    
+    
+    # ====== Prompt ======
+    relationship_prompt = f"""
+      Analyze the relationship between this existing code file and target project structure.
+      
+      Existing File Analysis:
+      - Path: {file_summary.file_path}
+      - Type: {file_summary.file_type}
+      - Functions: {', '.join(file_summary.main_functions)}
+      - Concepts: {', '.join(file_summary.key_concepts)}
+      - Summary: {file_summary.summary}
+      
+      Target Project Structure:
+      {self.target_structure}
+      
+      Available relationship types (with priority weights):
+      {chr(10).join(relationship_type_desc)}
+      
+      Identify potential relationships and provide analysis in this JSON format:
+      {{
+        "relationships": [
+          {{
+            "target_file_path": "path/in/target/structure",
+            "relationship_type": "direct_match|partial_match|reference|utility",
+            "confidence_score": 0.0-1.0,
+            "helpful_aspects": ["specific", "aspects", "that", "could", "help"],
+            "potential_contributions": ["how", "this", "could", "contribute"],
+            "usage_suggestions": "detailed suggestion on how to use this file"
+          }}
+        ]
+      }}
+      
+      Consider the priority weights when determining relationship types. Higher weight types should be preferred when multiple types apply.
+      Only include relationships with confidence > {self.min_confidence_score}. Focus on concrete, actionable connections.
+    """
+    
+    
+    # ====== Perform Find the Relationship ======
+    try:
+      llm_response = await self._call_llm(relationship_prompt, max=1500)
+      
+      match = re.search(r"\{.*\}", llm_response, re.DOTALL)
+      relationship_data = json.loads(match.group(0))
+      
+      relationships = []
+      for rel_data in relationship_data.get("relationships", []):
+        confidence_score = float(rel_data.get("confidence_score", 0.0))
+        relationship_type = rel_data.get("relationship_type", "reference")
+        
+        # Validate relationship type is in config
+        if relationship_type not in self.relationship_types:
+          if self.verbose_output:
+            self.logger.warning(
+              f"Unknown relationship type '{relationship_type}', using 'reference'"
+            )
+            relationship_type = "reference"
+            
+        # Apply configured minimum confidence filter
+        if confidence_score > self.min_confidence_score:
+          relationship = FileRelationship(
+            repo_file_path=file_summary.file_path,
+            target_file_path=rel_data.get("target_file_path", ""),
+            relationship_type=relationship_type,
+            confidence_score=confidence_score,
+            helpful_aspects=rel_data.get("helpful_aspects", []),
+            potential_contribution=rel_data.get(
+              "potential_contributions", []
+            ),
+            usage_suggestions=rel_data.get("usage_suggestions", "")
+          )
+          relationships.append(relationship)
+          
+      return relationships
+    
+    except Exception as e:
+      self.logger.error(
+        f"Error finding relationships for {file_summary.file_path}: {e}"
+      )
+      return []
   
   
   
@@ -835,7 +1116,18 @@ class CodeIndexer:
     total: int
   ) -> tuple:
     """Analyze a single file and its relationships (for concurrent processing)"""
-  
+    
+    if self.verbose_output:
+      self.logger.info(f"Analyzing file {index}/{total}: {file_path.name}")
+      
+    # Get file summary
+    file_summary = await self.analyze_file_content(file_path)
+    
+    # Find relationships
+    relationships = await self.find_relationships(file_summary)
+    
+    return file_summary, relationships
+    
   
   
   async def process_repository(self, repo_path: Path) -> RepoIndex:
@@ -868,9 +1160,129 @@ class CodeIndexer:
     
     
     
-  async def _process_files_concurrently(self, files_to_analysis: list) -> tuple:
+  async def _process_files_concurrently(self, files_to_analyze: list) -> tuple:
     """Process files concurrently with semaphore limiting"""
     
+    file_summaries = []
+    all_relationships = []
+    
+    # Create semaphore to limit concurrent tasks
+    semaphore = asyncio.Semaphore(self.max_concurrent_files)
+    tasks = []
+    
+    
+    async def _process_with_semaphore(file_path: Path, index: int, total: int):
+      async with semaphore:
+        # Add a small delay to space out concurrent requests
+        if index > 1:
+          await asyncio.sleep(self.request_delay * 0.5) # Reduced delay for concurrent processing
+        
+        return await self._analyze_single_file_with_relationships(file_path, index, total)
+    
+    # ===== If advantageous process --> Adopt using both approaches Concurrent & Sequential =====
+    try:
+      # Create tasks for all files
+      tasks = [
+        _process_with_semaphore(
+          file_path, i, len(files_to_analyze)
+        ) for i, file_path in enumerate(files_to_analyze, 1)
+      ]
+      
+      # Process tasks and collect results
+      if self.verbose_output:
+        self.logger.info(f"Starting concurrent analysis of {len(tasks)} files...")
+        
+      try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for i, result in enumerate(results):
+          
+          # === Failed ===
+          if isinstance(result, Exception):
+            self.logger.error(f"Failed to analyze file {files_to_analyze[i]} : {result}")
+            
+            # Create Error Summary
+            error_summary = FileSummary(
+              file_path=str(files_to_analyze[i].relative_to(self.code_base_path)),
+              file_type="error",
+              main_functions=[],
+              key_concepts=[],
+              dependencies=[],
+              summary=f"Concurrent analysis failed: {str(result)}",
+              lines_of_code=0,
+              last_modified=""
+            )
+            file_summaries.append(error_summary)
+            
+          # === Successfully ===
+          else:
+            file_summary, relationships = result
+            file_summaries.append(file_summary) # [1, 2, 3, [4, 5, 6]] - nested list! when using append element [4, 5, 6]
+            all_relationships.extend(relationships) # [1, 2, 3, 4, 5, 6] - flattened! when using extend element [4, 5, 6]
+      
+      except Exception as e:
+        self.logger.error(f"Concurrent processing failed: {e}")
+        # Cancel any remaining tasks
+        for task in tasks:
+          if not task.done() and not task.cancelled():
+            task.cancel()
+            
+        # Wait for cancelled tasks to complete
+        try:
+          await asyncio.sleep(0.1) # Brief wait for cancellation
+        except Exception:
+          pass
+        
+        # Fallback to sequential processing
+        self.logger.info("Falling back to sequential processing...")
+        return await self._process_files_sequentially(files_to_analyze)
+      
+      # All tasks in Concurrent Sessions which are finished successfully will be archived !!!
+      if self.verbose_output:
+        self.logger.info(f"Concurrent analysis completed: {len(file_summaries)} files processed")
+        
+      return file_summaries, all_relationships
+    
+    
+    
+    # ===== If disadvantageous process --> Using Sequential only =====
+    except Exception as e:
+      # Ensure all tasks are cancelled in case of unexpected errors
+      if tasks:
+        for task in tasks:
+          if not task.done() and not task.cancelled():
+            task.cancel()
+            
+      # Wait briefly for cancellation to complete
+      try:
+        await asyncio.sleep(0.1)
+      except Exception:
+        pass
+      
+      self.logger.info(f"Critical error in concurrent processing: {e}")
+      # Fallback to sequential processing
+      self.logger.info(
+        "Falling back to sequential processing due to critical error..."
+      )
+      return await self._process_files_sequentially(files_to_analyze)
+      
+      
+    # ===== Cleanup =====
+    finally:
+      # Final cleanup: ensure all tasks are properly finished
+      if tasks:
+        for task in tasks:
+          if not task.done() and not task.cancelled():
+            task.cancel()
+            
+      # Clear task references to help with garbage collection
+      tasks.clear()
+      
+      # Force garbage collection to help clean up semaphore and related resources
+      import gc
+      
+      gc.collect()
+      
     
     
   async def build_all_indexes(self) -> Dict[str, str]:
