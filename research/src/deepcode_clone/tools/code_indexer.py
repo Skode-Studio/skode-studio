@@ -23,6 +23,9 @@ import yaml
 import os
 from pathlib import Path
 from utils.llm_utils import get_preferred_llm_class
+import json
+import re
+from datetime import datetime
 
 
 
@@ -642,6 +645,31 @@ class CodeIndexer:
     response: str
   ):
     """Save LLM response for debugging"""
+    
+    try:
+      import hashlib
+      from datetime import datetime
+      
+      # Create a hash of the prompt for filename
+      prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:8]
+      timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+      filename = f"{provider}_{timestamp}_{prompt_hash}.json"
+      
+      debug_data = {
+        "timestamp": datetime.now().isoformat(),
+        "provide": provider,
+        "prompt": prompt[:500] + "..." if len(prompt) > 500 else prompt,
+        "response": response,
+        "full_prompt_length": len(prompt)
+      }
+      
+      debug_file = Path(self.raw_responses_dir) / filename
+      with open(debug_file, "w", encoding="utf-8") as f:
+        json.dump(debug_data, f, indent=2, ensure_ascii=False)
+        
+    except Exception as e:
+      self.logger.warning(f"Failed to save debug response: {e}")
+      
   
   
   
@@ -1136,27 +1164,106 @@ class CodeIndexer:
     repo_name = repo_path.name
     self.logger.info(f"Processing repository: {repo_name}")
   
-    # ========== Step 1: Generate file tree ==========
+    # ========== STEP 1: Generate file tree ==========
     self.logger.info("Generating file tree structure")
     file_tree = self.generate_file_tree(repo_path, max_depth=5)
     
-    # ========== Step 2: Get all files ==========
+    
+    # ========== STEP 2: Get all files ==========
     all_files = self.get_all_repo_files(repo_path)
     self.logger.info(f"Found {len(all_files)} files in {repo_name}")
     
-    # ========== Step 3: LLM pre-filtering of relevant files ==========
     
+    # ========== STEP 3: LLM pre-filtering of relevant files ==========
+    if self.enable_pre_filtering:
+      self.logger.info("Using LLM for Pre-filtering...")
+      selected_file_paths = self.pre_filter_files(repo_path, file_tree)
+    else:
+      self.logger.info("Pre-filtering is disable, will analyze all files in Step 5 instead of will to step 4")
+      selected_file_paths = []
+      
     
-    # ========== Step 4: Filter file list based on filtering results ==========
+    # ========== STEP 4: Filter file list based on filtering results ==========
+    if selected_file_paths:
+      files_to_analyze = self.filter_files_by_paths(
+        all_files,
+        selected_file_paths,
+        repo_path
+      )
+      self.logger.info(f"After LLM filtering, will analyze {len(files_to_analyze)} relevant files (from {len(all_files)} total)")
+    else:
+      files_to_analyze = all_files
+      self.logger.info("LLM filtering failed, will analyze all files")
+      
 
-    # ========== Step 5: Analyze filtered files (concurrent or sequential) ==========
+    # ========== STEP 5: Analyze filtered files (concurrent or sequential) ==========
+    # ENABLE CONCURRENT ANALYSIS
+    if self.enable_concurrent_analysis and len(files_to_analyze) > 1:
+      self.logger.info(
+        f"Using concurrent analysis with max {self.max_concurrent_files} parallel files"
+      )
+      file_summaries, all_relationships = await self._process_files_concurrently(files_to_analyze)
+    # UNABLE CONCURRENT ANALYSIS
+    else:
+      self.logger.info(
+        "Using sequential file analysis"
+      )
+      file_summaries, all_relationships = await self._process_files_sequentially(files_to_analyze)
+      
     
-    # ========== Step 6: Create repository index ==========
+    # ========== STEP 6: Create repository index ==========
+    repo_index = RepoIndex(
+      repo_name=repo_index,
+      total_files=len(all_files),
+      file_summaries=file_summaries,
+      relationships=all_relationships,
+      analysis_metadata={
+        "analysis_date": datetime.now().isoformat(),
+        "target_structure_analyzed": self.target_structure[:200] + "...",
+        "total_relationships_found": len(all_relationships),
+        "high_confidence_relationships": len(
+          [
+            r
+            for r in all_relationships
+            if r.confidence_score > self.high_confidence_threshold
+          ]
+        ),
+        "analyzer_version": "1.4.0", # Update version to reflect augmented LLM support
+        "pre_filtering_enabled": self.enable_pre_filtering,
+        "files_before_filtering": len(all_files),
+        "files_after_filtering": len(files_to_analyze),
+        "filtering_efficiency": round(
+          (1 - len(files_to_analyze) / len(all_files)) * 100,
+          2
+        ) if all_files else 0,
+        "config_file_used": self.indexer_config_path,
+        "min_confidence_score": self.min_confidence_score,
+        "high_confidence_threshold": self.high_confidence_threshold,
+        "concurrent_analysis_used": self.enable_concurrent_analysis,
+        "content_caching_enabled": self.enable_content_caching,
+        "cache_hits": len(self.content_cache) if self.content_cache else 0
+      }
+    )
     
+    return repo_index
+  
     
     
   async def _process_files_sequentially(self, files_to_analyze: list) -> tuple:
     """Process files sequentially (original method)"""
+    
+    file_summaries = []
+    all_relationships = []
+    
+    for i, file_path in enumerate(files_to_analyze, 1):
+      file_summary, relationships = await self._analyze_single_file_with_relationships(file_path, i, len(files_to_analyze))
+      file_summaries.append(file_summary)
+      all_relationships.extend(relationships)
+      
+      # Add configured delay to avoid overwhelming the LLM API
+      await asyncio.sleep(self.request_delay)
+      
+    return file_summaries, all_relationships
     
     
     
@@ -1294,41 +1401,240 @@ class CodeIndexer:
       )
       
     # Get all repository directories
-    # /my_project_example/
-    # ├── src/           ← included
-    # ├── tests/         ← included  
-    # ├── docs/          ← included
-    # ├── .git/          ← excluded (hidden)
-    # ├── .vscode/       ← excluded (hidden)
-    # └── README.md      ← excluded (not a directory)
     repo_dirs = [
       d
       for d in self.code_base_path.iterdir()
-      if d.is_dir() and not d.name.startswith(".")
+      if d.is_dir() and not d.name.startswith(".") # not include "." file
     ]
     
     if not repo_dirs:
       raise ValueError(f"No repositories found in {self.code_base_path}")
     
     self.logger.info(f"Found {len(repo_dirs)} repositories to process")
+    
+    # Process each repository
+    output_files = {}
+    statistics_data = []
+    
+    for repo_dir in repo_dirs:
+      try:
+        # Process repository
+        repo_index = await self.process_repository(repo_dir)
+        
+        # Generate output filename using configured pattern
+        output_filename = self.index_filename_pattern.format(
+          repo_name=repo_index.repo_name
+        )
+        output_file = self.output_dir / output_filename
+        
+        # Get output configuration
+        output_config = self.indexer_config.get("output", {})
+        json_indent = output_config.get("json_indent", 2)
+        ensure_ascii = not output_config.get("ensure_ascii", False)
+        
+        # Save to JSON file
+        with open(output_file, "w", encoding="utf-8") as f:
+          if self.include_metadata:
+            json.dump(
+              asdict(repo_index),
+              f,
+              indent=json_indent,
+              ensure_ascii=ensure_ascii
+            )
+          else:
+            # Save without metadata if disabled
+            index_data = asdict(repo_index)
+            index_data.pop("analysis_metadata", None)
+            json.dump(
+              index_data,
+              f,
+              intent=json_indent,
+              ensure_ascii=ensure_ascii
+            )
+            
+        output_files[repo_index.repo_name] = str(output_file)
+        self.logger.info(
+          f"Saved index for {repo_index.repo_name} to {output_file}"
+        )
+        
+        # Collect statistics for report
+        if self.generate_statistics:
+          stats = self._extract_repository_statistics(repo_index)
+          statistics_data.append(stats)
+          
+      except Exception as e:
+        self.logger.error(f"Failed to process repository {repo_dir.name}: {e}")
+        continue
+      
+    # Generate additional reports if configured
+    if self.generate_summary:
+      summary_path = self.generate_summary_report(output_files)
+      self.logger.info(f"Generated summary report: {summary_path}")
+      
+    if self.generate_statistics:
+      stats_path = self.generate_statistics_report(statistics_data)
+      self.logger.info(f"Generated statistics report: {stats_path}")
+    
+    return output_files
+    
+    
 
-    
-    
-    
-    
-    
   def _extract_repository_statistics(self, repo_index: RepoIndex) -> Dict[str, Any]:
     """Extract statistical information from a repository index"""
+    
+    metadata = repo_index.analysis_metadata
+    
+    # Count relationship types
+    relationship_type_counts = {}
+    for rel in repo_index.relationships:
+      rel_type = rel.relationship_type
+      relationship_type_counts[rel_type] = relationship_type_counts.get(rel_type, 0) + 1
+      
+    # Count file types
+    file_type_counts = {}
+    for file_summary in repo_index.file_summaries:
+      file_type = file_summary.file_type
+      file_type_counts[file_type] = file_type_counts.get(file_type, 0) + 1
+      
+    # Calculate statistics
+    total_lines = sum(fs.lines_of_code for fs in repo_index.file_summaries)
+    avg_lines = total_lines / len(repo_index.file_summaries) if repo_index.file_summaries else 0
+    
+    avg_confidence = sum(r.confidence_score for r in repo_index.relationships) / len(repo_index.relationships) if repo_index.relationships else 0
+    
+    return {
+      "repo_name": repo_index.repo_name,
+      "total_files": repo_index.total_files,
+      "analyzed_files": len(repo_index.file_summaries),
+      "total_relationships": len(repo_index.relationships),
+      "high_confidence_relationships": metadata.get("high_confidence_ralationships", 0),
+      "relationship_type_counts": relationship_type_counts,
+      "file_type_counts": file_type_counts,
+      "total_lines_of_code": total_lines,
+      "average_lines_per_file": round(avg_lines, 2),
+      "average_confidence_score": round(avg_confidence, 3),
+      "filtering_efficiency": metadata.get("filtering_efficiency", 0),
+      "concurrent_analysis_used": metadata.get("concurrent_analysis_used", False),
+      "cache_hits": metadata.get("cache_hits", 0),
+      "analysis_date": metadata.get("analysis_date", "unknown")
+    }
     
     
     
   def generate_statistics_report(self, statistics_data: List[Dict[str, Any]]) -> str:
     """Generate a detailed statistics report"""
     
+    stats_path = self.output_dir / self.stats_filename
+    
+    # Calculate aggregate statistics
+    total_repos = len(statistics_data)
+    total_files_analyzed = sum(stat["analyzed_files"] for stat in statistics_data)
+    total_relationships = sum(
+      stat["total_relationships"] for stat in statistics_data
+    )
+    total_lines = sum(stat["total_lines_of_code"] for stat in statistics_data)
+    
+    # Aggregate relationship types
+    aggregated_rel_types = {}
+    for stat in statistics_data:
+      for rel_type, count in stat["relationship_type_counts"].items():
+        aggregated_rel_types[rel_type] = (aggregated_rel_types.get(rel_type, 0) + count)
+        
+    # Aggregate file types
+    aggregated_file_types = {}
+    for stat in statistics_data:
+      for file_type, count in stat["file_type_counts"].items():
+        aggregated_file_types[file_type] = (aggregated_file_types.get(file_type, 0) + count)
+        
+    # Calculate averages
+    avg_files_per_repo = total_files_analyzed / total_repos if total_repos else 0
+    avg_relationships_per_repo = total_relationships / total_repos if total_repos else 0
+    avg_lines_per_repo = total_lines / total_repos if total_repos else 0
+    
+    # Build statistics report
+    statistics_report = {
+      "report_generation_time": datetime.now().isoformat(),
+      "analyzer_version": "1.4.0",
+      "configuration_used": {
+        "config_file": self.indexer_config_path,
+        "concurrent_analysis_enabled": self.enable_concurrent_analysis,
+        "content_caching_enabled": self.enable_content_caching,
+        "pre_filtering_enabled": self.enable_pre_filtering,
+        "min_confidence_score": self.min_confidence_score,
+        "high_confidence_threshold": self.high_confidence_threshold
+      },
+      "aggregate_statistics": {
+        "total_repositories_processed": total_repos,
+        "total_files_analyzed": total_files_analyzed,
+        "total_relationships_found": total_relationships,
+        "total_lines_of_code": total_lines,
+        "average_files_per_repository": round(avg_files_per_repo, 2),
+        "average_relationships_per_repository": round(avg_relationships_per_repo, 2),
+        "average_lines_per_repository": round(avg_lines_per_repo, 2),
+      },
+      "relationship_type_distribution": aggregated_rel_types,
+      "file_type_distribution": aggregated_file_types,
+      "repository_details": statistics_data,
+      "performance_metrics": {
+        "concurrent_processing_repos": sum(1 for s in statistics_data if s.get("concurrent_analysis_used", False)),
+        "cache_efficiency": {
+          "total_cache_hits": sum(s.get("cache_hits", 0) for s in statistics_data),
+          "repositories_with_caching": sum(1 for s in statistics_data if s.get("cache_hits", 0) > 0)
+        },
+        "filtering_efficiency": {
+          "average_filtering_efficiency": round(sum(s.get("filtering_efficiency", 0) for s in statistics_data) / total_repos, 2) if total_repos else 0,
+          "max_filtering_efficiency": max((s.get("filtering_efficiency", 0) for s in statistics_data), default=0),
+          "min_filtering_efficiency": min((s.get("filtering_efficiency", 0) for s in statistics_data), default=0)
+        }
+      }
+    }
+    
+    # Get output configuration
+    output_config = self.indexer_config.get("output", {})
+    json_indent = output_config.get("json_indent", 2)
+    ensure_ascii = not output_config.get("ensure_ascii", False)
+    
+    with open(stats_path, "w", encoding="utf-8") as f:
+      json.dump(statistics_report, f, indent=json_indent, ensure_ascii=ensure_ascii)
+      
+    return str(stats_path)
+    
     
     
   def generate_summary_report(self, output_files: Dict[str, str]) -> str:
     """Generate a summary report of all indexes created"""
+    
+    report_path = self.output_dir / "indexing_summary.json"
+    
+    # Get output configuration from config file
+    output_config = self.indexer_config.get("output", {})
+    json_indent = output_config.get("json_indent", 2)
+    ensure_ascii = not output_config.get("ensure_ascii", False)
+    
+    summary_data = {
+      "indexing_completion_time": datetime.now().isoformat(),
+      "total_repositories_processed": len(output_files),
+      "output_files": output_files,
+      "target_structure": self.target_structure,
+      "code_base_path": str(self.code_base_path),
+      "configuration": {
+        "config_file_used": self.indexer_config_path,
+        "api_config_file": self.config_path,
+        "pre_filtering_enabled": self.enable_pre_filtering,
+        "min_confidence_score": self.min_confidence_score,
+        "high_confidence_threshold": self.high_confidence_threshold,
+        "max_file_size": self.max_file_size,
+        "max_content_length": self.max_content_length,
+        "request_delay": self.request_delay,
+        "supported_extensions_count": len(self.supported_extensions),
+        "skip_directories_count": len(self.skip_directories)
+      }
+    }
+    
+    with open(report_path, "w", encoding="utf-8") as f:
+      json.dump(summary_data, f, indent=json_indent, ensure_ascii=ensure_ascii)
+      
+    return str(report_path)
     
 
 
@@ -1403,30 +1709,18 @@ async def main():
     # Display configuration information
     print(f"📁 Code base path: {indexer.code_base_path}")
     print(f"📂 Output directory: {indexer.output_dir}")
-    print(
-        f"🤖 Default models: Anthropic={indexer.default_models['anthropic']}, OpenAI={indexer.default_models['openai']}"
-    )
+    print(f"🤖 Default models: Anthropic={indexer.default_models['anthropic']}, OpenAI={indexer.default_models['openai']}")
     print(f"🔧 Preferred LLM: {get_preferred_llm_class(api_config_file).__name__}")
-    print(
-        f"⚡ Concurrent analysis: {'enabled' if indexer.enable_concurrent_analysis else 'disabled'}"
-    )
-    print(
-        f"🗄️  Content caching: {'enabled' if indexer.enable_content_caching else 'disabled'}"
-    )
-    print(
-        f"🔍 Pre-filtering: {'enabled' if indexer.enable_pre_filtering else 'disabled'}"
-    )
+    print(f"⚡ Concurrent analysis: {'enabled' if indexer.enable_concurrent_analysis else 'disabled'}")
+    print(f"🗄️  Content caching: {'enabled' if indexer.enable_content_caching else 'disabled'}")
+    print(f"🔍 Pre-filtering: {'enabled' if indexer.enable_pre_filtering else 'disabled'}")
     print(f"🐛 Debug mode: {'enabled' if indexer.verbose_output else 'disabled'}")
-    print(
-        f"🎭 Mock responses: {'enabled' if indexer.mock_llm_responses else 'disabled'}"
-    )
+    print(f"🎭 Mock responses: {'enabled' if indexer.mock_llm_responses else 'disabled'}")
     
     
     # Validate configuration
     if not indexer.code_base_path.exists():
-      raise FileNotFoundError(
-        f"Code base path doesnot exist: {indexer.code_base_path}"
-      )
+      raise FileNotFoundError(f"Code base path doesnot exist: {indexer.code_base_path}")
       
     if not target_structure:
       raise ValueError("Target structure is required for analysis")
@@ -1434,8 +1728,32 @@ async def main():
     
     print("STARTING INDEXING PROCESS...")
     
+    # Build all indexes
+    output_files = await indexer.build_all_indexes()
     
-    
+    # Display results
+    print("\n✅ Indexing completed successfully!")
+    print(f"📊 Processed {len(output_files)} repositories")
+    print("📁 Output files:")
+    for repo_name, file_path in output_files.items():
+      print(f"   - {repo_name}: {file_path}")
+      
+    # Display additional reports generated
+    if indexer.generate_summary:
+      summary_file = indexer.output_dir / indexer.summary_filename
+      if summary_file.exists():
+        print(f"📋 Summary report: {summary_file}")
+        
+    if indexer.generate_statistics:
+      stats_file = indexer.output_dir / indexer.stats_filename
+      if stats_file.exists():
+        print(f"📈 Statistics report: {stats_file}")
+        
+    # Performance information
+    if indexer.enable_content_caching and indexer.content_cache:
+      print(f"🗄️  Cache performance: {len(indexer.content_cache)} items cached")
+      
+    print("\n🎉 Code indexing process completed successfully!")
     
     
   except FileNotFoundError as e:
@@ -1447,7 +1765,16 @@ async def main():
   except Exception as e:
     print(f"❌ Indexing failed: {e}")
     print("💡 Check the logs for more details")
-    
+    # Print debug information if available
+    try:
+      indexer
+      if indexer.verbose_output:
+        import traceback
+        
+        print("\n🐛 Debug information:")
+        traceback.print_exc()
+    except NameError:
+      pass
     
     
     
