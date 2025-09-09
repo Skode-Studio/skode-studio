@@ -20,6 +20,9 @@ Key Inprovement:
 from dataclasses import dataclass
 import logging
 from typing import Dict, List, Tuple
+from pathlib import Path
+import json
+
 
 # Import MCP modules
 from mcp.server.fastmcp import FastMCP
@@ -62,8 +65,29 @@ class RelationshipInfo:
   usage_suggestions: str
   
 
+
 def load_index_files_from_directory(indexes_directory: str) -> Dict[str, Dict]:
   """Load all index files from specified directory"""
+  
+  indexes_path = Path(indexes_directory).resolve()
+  
+  if not indexes_path.exists():
+    logger.warning(f"Indexes directory does not exist: {indexes_path}")
+    return {}
+  
+  index_cache = {}
+  
+  for index_file in indexes_path.glob("*.json"):
+    try:
+      with open(index_file, "r", encoding="utf-8") as f:
+        index_data = json.load(f)
+        index_cache[index_file.stem] = index_data
+        logger.info(f"Loaded index file: {index_file.name}")
+    except Exception as e:
+      logger.error(f"Failed to load index file {index_file.name}: {e}")
+      
+  logger.info(f"Loaded {len(index_cache)} index files from {indexes_path}")
+  return index_cache
   
   
 
@@ -148,6 +172,7 @@ async def search_code_references(
     """"""
 
 
+
 @mcp.tool()
 async def get_indexes_overview(indexes_path: str) -> str:
   """
@@ -159,12 +184,80 @@ async def get_indexes_overview(indexes_path: str) -> str:
   Returns:
     Overview information of all available reference code JSON string
   """
+  
+  try:
+    # Load index files from specified directory
+    index_cache = load_index_files_from_directory(indexes_path)
+    
+    if not index_cache:
+      result = {
+        "status": "error",
+        "message": f"No index files found in: {indexes_path}",
+        "indexes_path": indexes_path
+      }
+      return json.dumps(result, ensure_ascii=False, indent=2)
+    
+    overview = {
+      "total_repos": len(index_cache),
+      "repositories": {}
+    }
+    
+    for repo_name, index_data in index_cache.items():
+      repo_info = {
+        "repo_name": index_data.get("repo_name", repo_name),
+        "total_files": index_data.get("total_files", 0),
+        "file_types": [],
+        "main_concepts": [],
+        "total_relationships": len(index_data.get("relationships", []))
+      }
+      
+      # Collect file types and concepts
+      file_summaries = index_data.get("file_summaries", [])
+      file_types = set()
+      concepts = set()
+      
+      for file_summary in file_summaries:
+        file_types.add(file_summary.get("file_type", "Unknown"))
+        concepts.update(file_summary.get("key_concepts", []))
+        
+      repo_info["file_types"] = sorted(list(file_types))
+      repo_info["main_concepts"] = sorted(list(concepts))[:20] # Limit concept count
+      
+      overview["repositories"][repo_name] = repo_info
+      
+    
+    result = {
+      "status": "success",
+      "overview": overview,
+      "indexes_directory": str(Path(indexes_path).resolve()),
+      "total_indexes_loaded": len(index_cache)
+    }
+    
+    return json.dumps(result, ensure_ascii=False, indent=2)
+  
+  except Exception as e:
+    result = {
+      "status": "error",
+      "message": f"Failed to get indexes overview: {str(e)}",
+      "indexes_path": indexes_path
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+    
+    
+    
 
 
 
 def main():
   """Main function"""
-  
+  logger.info("Starting unified Code Reference Indexer MCP server")
+  logger.info("Available tools:")
+  logger.info(
+    "1. search_code_references(indexes_path, target_file, keywords, max_results) - UNIFIED TOOL"
+  )
+  logger.info(
+    "2. get_indexes_overview(indexes_path) - Get overview of available indexes"
+  )
   
   # Run MCP Server  
   mcp.run()
